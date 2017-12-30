@@ -45,6 +45,8 @@
 #define IGMP_MEMBERSHIP_QUERY IGMP_HOST_MEMBERSHIP_QUERY
 #endif
 
+#define MAX_INT_COUNT 20 // 20 should be enough?
+
 typedef struct igmpqd_options {
     int   debug;
     int   daemonize;
@@ -55,12 +57,15 @@ typedef struct igmpqd_options {
     char *username;
     char *groupname;
     char *pidfile;
+    struct in_addr interfaces[MAX_INT_COUNT]; // 20 should be enough?
+    int   interface_count;
 } igmpqd_options_t;
 
 void
 usage(char *command)
 {
-    printf("usage: %s [-dfhlv] [-m MGROUP] [-u USER] [-s INTERVAL] [-p PIDFILE]\n",
+    //printf("usage: %s [-dfhlv] [-m MGROUP] [-u USER] [-s INTERVAL] [-p PIDFILE]\n",
+    printf("usage: %s [-dfhlv] [-i INTERFACE(IP) [ -i INT [ ...]]] [-u USER] [-s INTERVAL] [-p PIDFILE]\n",
         command);
 }
 
@@ -69,8 +74,9 @@ parse_command_line(int argc, char **argv, igmpqd_options_t *options)
 {
     char *endptr = NULL;
     int c;
+    struct in_addr tmp_addr;
 
-    while ((c = getopt(argc, argv, "dfg:hlp:s:u:v")) != -1) {
+    while ((c = getopt(argc, argv, "dfg:hlp:s:u:vi:")) != -1) {
         switch (c) {
         case 'd':
             options->debug = 1;
@@ -115,6 +121,19 @@ parse_command_line(int argc, char **argv, igmpqd_options_t *options)
             options->version = 1;
             break;
 
+        case 'i':
+            if (options->interface_count < MAX_INT_COUNT) {
+                tmp_addr.s_addr = inet_addr(optarg);
+                if (tmp_addr.s_addr == INADDR_NONE) {
+                    logger(LOG_LEVEL_ERR, "Invalid address '%s'", optarg);
+                } else {
+                    options->interfaces[options->interface_count++].s_addr = tmp_addr.s_addr;
+                }
+            } else {
+                logger(LOG_LEVEL_ERR, "Exceed max amount of interfaces allowed (%d)", MAX_INT_COUNT);
+            }
+            break;
+
         default:
             usage(argv[0]);
             return -1;
@@ -154,10 +173,11 @@ int
 main(int argc, char **argv)
 {
     struct igmp igmp;
-    struct in_addr mgroup, allhosts;
+    struct in_addr mgroup, allhosts, tmp_addr;
     struct sockaddr_in dst;
     igmpqd_options_t *options;
-    int sockfd;
+    int sockfd[MAX_INT_COUNT];
+    int i, failed_cnt, int_cnt;
 
     /* Parse command line options */
     options = malloc(sizeof(igmpqd_options_t));
@@ -185,11 +205,32 @@ main(int argc, char **argv)
     /* Initialize logging */
     init_logger(options->use_syslog);
 
-    /* Create socket */
-    sockfd = socket(PF_INET, SOCK_RAW, IPPROTO_IGMP);
-    if (sockfd == -1) {
-        logger(LOG_LEVEL_ERR, "Could not open raw socket: %s", strerror(errno));
-        goto fail;
+    /* Create socket(s) */
+    if ((int_cnt = options->interface_count) == 0) {
+        int_cnt = 1;
+        i=0;
+        sockfd[i] = socket(PF_INET, SOCK_RAW, IPPROTO_IGMP);
+        if (sockfd[i] == -1) {
+            logger(LOG_LEVEL_ERR, "Could not open raw socket: %s", strerror(errno));
+            goto fail;
+        }
+    } else {
+        failed_cnt = 0;
+        for (i = 0; i < int_cnt; i++) {
+            sockfd[i] = socket(PF_INET, SOCK_RAW, IPPROTO_IGMP);
+            if (sockfd[i] == -1) {
+                logger(LOG_LEVEL_ERR, "Could not open raw socket: %s", strerror(errno));
+                failed_cnt++;
+                continue;
+            }
+            tmp_addr.s_addr = options->interfaces[i].s_addr;
+            if (setsockopt(sockfd[i], IPPROTO_IP, IP_MULTICAST_IF, &tmp_addr, sizeof(tmp_addr)) != 0) {
+                logger(LOG_LEVEL_ERR, "Could not set socket multicast if: %s", strerror(errno));
+                failed_cnt++;
+                continue;
+            }
+        }
+        if (failed_cnt == int_cnt) goto fail;
     }
 
     /* Drop privileges */
@@ -230,8 +271,10 @@ main(int argc, char **argv)
 
     /* Transmit loop */
     while (1) {
-        if (sendto(sockfd, &igmp, sizeof(igmp), 0, (struct sockaddr*)&dst, sizeof(dst)) == -1) {
-            logger(LOG_LEVEL_ERR, "Could not send IGMP query: %s", strerror(errno));
+        for (i = 0; i < int_cnt; i++) {
+            if (sendto(sockfd[i], &igmp, sizeof(igmp), 0, (struct sockaddr*)&dst, sizeof(dst)) == -1) {
+                logger(LOG_LEVEL_ERR, "Could not send IGMP query: %s", strerror(errno));
+            }
         }
         sleep(options->interval);
     }
